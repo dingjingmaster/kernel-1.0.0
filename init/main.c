@@ -5,8 +5,15 @@
  */
 
 #include <stdarg.h>
+#include <linux/version.h>
 
+#if LINUX_VERSION_CODE > KERNEL_VERSION(3, 3, 0)
+#include <asm/switch_to.h>
+#else
 #include <asm/system.h>
+#endif
+
+
 #include <asm/io.h>
 
 #include <linux/types.h>
