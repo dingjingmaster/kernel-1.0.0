@@ -1,0 +1,36 @@
+## linux kernel 1.0.0
+
+dowload url:[https://mirrors.edge.kernel.org/pub/linux/kernel/v1.0/linux-1.0.tar.bz2](https://mirrors.edge.kernel.org/pub/linux/kernel/v1.0/linux-1.0.tar.bz2)
+
+### If you install the full sources, do a
+
+		cd /usr/src
+		tar xvf linux-1.0.tar
+
+   to get it all put in place.
+
+### if you install by patching, you need a *clean* 0.99.15 source tree, which presumably exists in /usr/src/linux.  If so, to get the kernel patched, just do a
+
+		cd /usr/src
+		patch -p0 < linux-1.0.patch
+
+   and you should be ok.  You may want to remove the backup files (xxx~
+   or xxx.orig), and make sure that there are no failed patches (xxx# or
+   xxx.rej).
+
+### make sure your /usr/include/linux and /usr/include/asm directories are just symlinks to the kernel sources:
+
+```
+cd /usr/include
+rm -rf linux
+rm -rf asm
+ln -s /usr/src/linux/include/linux .
+ln -s /usr/src/linux/include/asm .
+```
+### make sure you have no stale .o files and dependencies lying around:
+
+```
+cd /usr/src/linux
+make mrproper
+```
+
