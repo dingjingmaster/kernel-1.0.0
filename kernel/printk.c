@@ -40,101 +40,135 @@ static unsigned long log_start = 0;
 static unsigned long logged_chars = 0;
 
 /*
- * Commands to sys_syslog:
- *
- * 	0 -- Close the log.  Currently a NOP.
- * 	1 -- Open the log. Currently a NOP.
- * 	2 -- Read from the log.
- * 	3 -- Read up to the last 4k of messages in the ring buffer.
- * 	4 -- Read and clear last 4k of messages in the ring buffer
- * 	5 -- Clear ring buffer.
- * 	6 -- Disable printk's to console
- * 	7 -- Enable printk's to console
- *	8 -- Set level of messages printed to console
+ * sys_syslog - 系统日志操作
+ * 实现对内核日志缓冲区的各种操作，包括读取、清除和控制台输出
+ * 支持环形缓冲区机制，允许用户空间程序访问内核消息
+ * 
+ * sys_syslog命令说明:
+ *	0 -- 关闭日志(当前为空操作)
+ *	1 -- 打开日志(当前为空操作)
+ *	2 -- 从日志读取(顺序读取)
+ *	3 -- 读取环形缓冲区中最近的4k消息
+ *	4 -- 读取并清除环形缓冲区中最近的4k消息
+ *	5 -- 清除环形缓冲区
+ *	6 -- 禁用printk输出到控制台
+ *	7 -- 启用printk输出到控制台
+ *	8 -- 设置输出到控制台的消息级别
+ * 
+ * 参数:
+ * type - 操作类型
+ * buf - 用户空间缓冲区指针(用于读取操作)
+ * len - 缓冲区长度
+ * 
+ * 返回值: 成功返回读取的字节数或0，失败返回错误码
  */
-asmlinkage int sys_syslog(int type, char * buf, int len)
+asmlinkage int
+sys_syslog(int type, char * buf, int len)
 {
-	unsigned long i, j, count;
-	int do_clear = 0;
-	char c;
-	int error;
+	unsigned long i, j, count;	/* 循环计数器 */
+	int do_clear = 0;		/* 是否清除缓冲区标志 */
+	char c;				/* 临时字符变量 */
+	int error;			/* 错误码 */
 
+	/* 检查权限(类型3允许所有用户，其他需要超级用户) */
 	if ((type != 3) && !suser())
-		return -EPERM;
+		return -EPERM;			/* 权限不足 */
+	/* 根据操作类型执行相应操作 */
 	switch (type) {
-		case 0:		/* Close log */
-			return 0;
-		case 1:		/* Open log */
-			return 0;
-		case 2:		/* Read from log */
+		case 0:	/* 关闭日志 */
+			return 0;			/* 空操作 */
+		case 1:	/* 打开日志 */
+			return 0;			/* 空操作 */
+		case 2:	/* 从日志顺序读取 */
+			/* 检查参数有效性 */
 			if (!buf || len < 0)
-				return -EINVAL;
+				return -EINVAL;		/* 无效参数 */
 			if (!len)
-				return 0;
+				return 0;			/* 无数据请求 */
+			/* 验证用户空间缓冲区的可写性 */
 			error = verify_area(VERIFY_WRITE,buf,len);
 			if (error)
-				return error;
+				return error;			/* 缓冲区无效 */
+			/* 关中断，准备访问共享数据 */
 			cli();
+			/* 等待日志数据可用 */
 			while (!log_size) {
+				/* 检查是否有待处理信号 */
 				if (current->signal & ~current->blocked) {
-					sti();
-					return -ERESTARTSYS;
+					sti();			/* 开中断 */
+					return -ERESTARTSYS;	/* 系统调用重启 */
 				}
+				/* 在日志等待队列上可中断睡眠 */
 				interruptible_sleep_on(&log_wait);
 			}
+			/* 从环形缓冲区读取数据 */
 			i = 0;
 			while (log_size && i < len) {
+				/* 获取当前字符 */
 				c = *((char *) log_buf+log_start);
+				/* 更新环形缓冲区指针 */
 				log_start++;
 				log_size--;
-				log_start &= LOG_BUF_LEN-1;
+				log_start &= LOG_BUF_LEN-1;	/* 环形缓冲区 */
+				/* 开中断，写入用户空间 */
 				sti();
 				put_fs_byte(c,buf);
 				buf++;
 				i++;
+				/* 关中断，准备下一次读取 */
 				cli();
 			}
-			sti();
-			return i;
-		case 4:		/* Read/clear last kernel messages */
-			do_clear = 1; 
-			/* FALL THRU */
-		case 3:		/* Read last kernel messages */
+			sti();			/* 开中断 */
+			return i;			/* 返回读取的字节数 */
+		case 4:	/* 读取并清除最近的内核消息 */
+			do_clear = 1; 			/* 设置清除标志 */
+			/* FALL THRU */		/* 继续执行case 3的代码 */
+		case 3:	/* 读取环形缓冲区中最近的4k消息 */
+			/* 检查参数有效性 */
 			if (!buf || len < 0)
-				return -EINVAL;
+				return -EINVAL;		/* 无效参数 */
 			if (!len)
-				return 0;
+				return 0;			/* 无数据请求 */
+			/* 验证用户空间缓冲区的可写性 */
 			error = verify_area(VERIFY_WRITE,buf,len);
 			if (error)
-				return error;
+				return error;			/* 缓冲区无效 */
+			/* 计算实际读取的字节数 */
 			count = len;
 			if (count > LOG_BUF_LEN)
-				count = LOG_BUF_LEN;
+				count = LOG_BUF_LEN;		/* 限制最大读取量 */
 			if (count > logged_chars)
-				count = logged_chars;
+				count = logged_chars;	/* 不超过已记录的字符数 */
+			/* 计算读取起始位置 */
 			j = log_start + log_size - count;
+			/* 从环形缓冲区读取数据 */
 			for (i = 0; i < count; i++) {
+				/* 获取当前字符 */
 				c = *((char *) log_buf+(j++ & (LOG_BUF_LEN-1)));
+				/* 写入用户空间 */
 				put_fs_byte(c, buf++);
 			}
+			/* 如果需要清除缓冲区 */
 			if (do_clear)
-				logged_chars = 0;
-			return i;
-		case 5:		/* Clear ring buffer */
-			logged_chars = 0;
-			return 0;
-		case 6:		/* Disable logging to console */
-			console_loglevel = 1; /* only panic messages shown */
-			return 0;
-		case 7:		/* Enable logging to console */
+				logged_chars = 0;		/* 重置计数器 */
+			return i;			/* 返回读取的字节数 */
+		case 5:	/* 清除环形缓冲区 */
+			logged_chars = 0;		/* 重置计数器 */
+			return 0;			/* 成功返回 */
+		case 6:	/* 禁用printk输出到控制台 */
+			console_loglevel = 1; /* 只显示panic消息 */
+			return 0;			/* 成功返回 */
+		case 7:	/* 启用printk输出到控制台 */
 			console_loglevel = DEFAULT_CONSOLE_LOGLEVEL;
-			return 0;
-		case 8:
+			return 0;			/* 成功返回 */
+		case 8:	/* 设置输出到控制台的消息级别 */
+			/* 检查参数有效性 */
 			if (len < 0 || len > 8)
-				return -EINVAL;
-			console_loglevel = len;
-			return 0;
+				return -EINVAL;		/* 无效参数 */
+			console_loglevel = len;	/* 设置新的日志级别 */
+			return 0;			/* 成功返回 */
 	}
+	/* 无效的操作类型 */
 	return -EINVAL;
 }
 

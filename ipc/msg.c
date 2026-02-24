@@ -25,86 +25,138 @@ static int used_queues = 0;
 static int max_msqid = 0;
 static struct wait_queue *msg_lock = NULL;
 
+/*
+ * msg_init - 初始化消息队列系统
+ * 在系统启动时调用，用于初始化消息队列相关的全局变量和数据结构
+ * 为后续的消息队列操作准备初始状态
+ */
 void msg_init (void)
 {
-	int id;
+	int id;		/* 循环计数器，用于遍历消息队列数组 */
 	
+	/* 初始化消息队列数组：将所有消息队列槽位标记为未使用 */
 	for (id=0; id < MSGMNI; id++) 
 		msgque[id] = (struct msqid_ds *) IPC_UNUSED;
+	/* 初始化全局统计变量：
+	 * msgbytes: 所有消息队列中的总字节数
+	 * msghdrs: 所有消息队列中的消息头数
+	 * msg_seq: 消息序列号(用于生成唯一的消息队列ID)
+	 * max_msqid: 当前使用的最大消息队列ID
+	 * used_queues: 当前使用的消息队列数量
+	 */
 	msgbytes = msghdrs = msg_seq = max_msqid = used_queues = 0;
+	/* 初始化消息队列锁为NULL(表示无进程等待) */
 	msg_lock = NULL;
 	return;
 }
 
+/*
+ * sys_msgsnd - 消息发送系统调用
+ * 将消息发送到指定的消息队列
+ * 
+ * 参数:
+ * msqid - 消息队列标识符
+ * msgp - 指向消息缓冲区的指针
+ * msgsz - 消息大小(字节)
+ * msgflg - 发送标志位
+ * 
+ * 返回值: 成功返回发送的字节数，失败返回错误码
+ */
 int sys_msgsnd (int msqid, struct msgbuf *msgp, int msgsz, int msgflg)
 {
-	int id, err;
-	struct msqid_ds *msq;
-	struct ipc_perm *ipcp;
-	struct msg *msgh;
-	long mtype;
+	int id, err;				/* 队列索引和错误码 */
+	struct msqid_ds *msq;			/* 消息队列结构体指针 */
+	struct ipc_perm *ipcp;			/* IPC权限结构体指针 */
+	struct msg *msgh;			/* 消息头结构体指针 */
+	long mtype;				/* 消息类型 */
 	
+	/* 参数验证：检查消息大小和队列ID的有效性 */
 	if (msgsz > MSGMAX || msgsz < 0 || msqid < 0)
-		return -EINVAL;
+		return -EINVAL;			/* 无效参数 */
+	/* 检查消息缓冲区指针是否有效 */
 	if (!msgp) 
-		return -EFAULT;
+		return -EFAULT;			/* 错误地址 */
+	/* 验证用户空间缓冲区的可读性 */
 	err = verify_area (VERIFY_READ, msgp->mtext, msgsz);
 	if (err) 
-		return err;
+		return err;			/* 缓冲区访问错误 */
+	/* 从用户空间获取消息类型 */
 	if ((mtype = get_fs_long (&msgp->mtype)) < 1)
-		return -EINVAL;
+		return -EINVAL;			/* 无效的消息类型 */
+	/* 计算消息队列在数组中的索引 */
 	id = msqid % MSGMNI;
+	/* 获取消息队列结构体 */
 	msq = msgque [id];
+	/* 检查消息队列是否存在 */
 	if (msq == IPC_UNUSED || msq == IPC_NOID)
-		return -EINVAL;
+		return -EINVAL;			/* 无效的消息队列 */
+	/* 获取IPC权限结构体 */
 	ipcp = &msq->msg_perm; 
 
- slept:
+/* 重新检查队列状态(可能在被阻塞期间发生变化) */
+slept:
+	/* 检查序列号是否匹配(防止使用已删除的队列) */
 	if (ipcp->seq != (msqid / MSGMNI)) 
-		return -EIDRM;
+		return -EIDRM;			/* 消息队列已被删除 */
+	/* 检查写权限 */
 	if (ipcperms(ipcp, S_IWUGO)) 
-		return -EACCES;
+		return -EACCES;			/* 权限不足 */
 	
+	/* 检查队列是否有足够的空间 */
 	if (msgsz + msq->msg_cbytes > msq->msg_qbytes) { 
 		/* no space in queue */
+		/* 如果设置了非阻塞标志，立即返回 */
 		if (msgflg & IPC_NOWAIT)
-			return -EAGAIN;
+			return -EAGAIN;		/* 队列已满，非阻塞模式 */
+		/* 检查是否有待处理的信号 */
 		if (current->signal & ~current->blocked)
-			return -EINTR;
+			return -EINTR;		/* 被信号中断 */
+		/* 在写等待队列上可中断睡眠 */
 		interruptible_sleep_on (&msq->wwait);
+		/* 唤醒后重新检查队列状态 */
 		goto slept;
 	}
 	
-	/* allocate message header and text space*/ 
+	/* 分配消息头和文本空间 */ 
 	msgh = (struct msg *) kmalloc (sizeof(*msgh) + msgsz, GFP_USER);
 	if (!msgh)
-		return -ENOMEM;
+		return -ENOMEM;			/* 内存不足 */
+	/* 设置消息文本的存储位置(紧跟在消息头之后) */
 	msgh->msg_spot = (char *) (msgh + 1);
+	/* 从用户空间复制消息文本到内核空间 */
 	memcpy_fromfs (msgh->msg_spot, msgp->mtext, msgsz); 
 	
+	/* 再次检查队列状态(防止竞争条件) */
 	if (msgque[id] == IPC_UNUSED || msgque[id] == IPC_NOID
 		|| ipcp->seq != msqid / MSGMNI) {
+		/* 队列已被删除，释放已分配的内存 */
 		kfree_s (msgh, sizeof(*msgh) + msgsz);
-		return -EIDRM;
+		return -EIDRM;			/* 消息队列已被删除 */
 	}
 
-	msgh->msg_next = NULL;
+	/* 将消息添加到队列尾部 */
+	msgh->msg_next = NULL;			/* 新消息是队列的最后一个 */
 	if (!msq->msg_first)
+		/* 队列为空，新消息是第一个也是最后一个 */
 		msq->msg_first = msq->msg_last = msgh;
 	else {
+		/* 队列不为空，将新消息添加到尾部 */
 		msq->msg_last->msg_next = msgh;
 		msq->msg_last = msgh;
 	}
-	msgh->msg_ts = msgsz;
-	msgh->msg_type = mtype;
-	msq->msg_cbytes += msgsz;
-	msgbytes  += msgsz;
-	msghdrs++;
-	msq->msg_qnum++;
-	msq->msg_lspid = current->pid;
-	msq->msg_stime = CURRENT_TIME;
+	/* 更新消息和队列的统计信息 */
+	msgh->msg_ts = msgsz;			/* 设置消息大小 */
+	msgh->msg_type = mtype;			/* 设置消息类型 */
+	msq->msg_cbytes += msgsz;		/* 增加队列当前字节数 */
+	msgbytes  += msgsz;			/* 增加全局字节数统计 */
+	msghdrs++;				/* 增加全局消息头数统计 */
+	msq->msg_qnum++;			/* 增加队列消息数量 */
+	msq->msg_lspid = current->pid;		/* 设置最后发送进程ID */
+	msq->msg_stime = CURRENT_TIME;		/* 设置最后发送时间 */
+	/* 如果有进程在等待读取，唤醒它们 */
 	if (msq->rwait)
 		wake_up (&msq->rwait);
+	/* 返回发送的字节数 */
 	return msgsz;
 }
 

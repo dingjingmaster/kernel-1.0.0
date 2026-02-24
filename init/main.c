@@ -355,120 +355,222 @@ static void copro_timeout(void)
 	outb_p(0,0xf0);
 }
 
+/*
+ * start_kernel() - Linux内核启动入口函数
+ * 
+ * 功能：内核启动的核心入口点，负责系统初始化的所有阶段
+ * 
+ * 启动阶段：
+ * 1. 硬件环境初始化
+ * 2. 内存管理初始化
+ * 3. 设备驱动初始化
+ * 4. 文件系统初始化
+ * 5. 系统服务初始化
+ * 6. 用户空间启动
+ * 
+ * 调用顺序：
+ * 由bootloader调用 -> start_kernel() -> init() -> 用户空间init进程
+ * 
+ * 内存布局：
+ * - 内核空间：0xC0000000以上（3GB以上）
+ * - 用户空间：0x00000000-0xBFFFFFFF（3GB以下）
+ * - 内核代码和数据：1MB开始
+ * - 低内存：0-1MB（用于BIOS、硬件等）
+ * 
+ * 注意：此时中断仍然被禁用，需要完成基本设置后才能启用
+ */
 asmlinkage void start_kernel(void)
 {
 /*
- * Interrupts are still disabled. Do necessary setups, then
- * enable them
+ * 中断仍然被禁用。执行必要的设置，然后启用中断
+ * 
+ * 注意：此时处于实模式到保护模式的转换过程中
  */
+
+	/* 第一阶段：基本硬件环境初始化 */
+	/* 设置调用门，用于系统调用接口 */
 	set_call_gate(&default_ldt,lcall7);
- 	ROOT_DEV = ORIG_ROOT_DEV;
- 	drive_info = DRIVE_INFO;
- 	screen_info = SCREEN_INFO;
-	aux_device_present = AUX_DEVICE_INFO;
+	
+	/* 从BIOS获取基本硬件信息 */
+ 	ROOT_DEV = ORIG_ROOT_DEV;      /* 根设备号 */
+ 	drive_info = DRIVE_INFO;      /* 硬盘参数 */
+ 	screen_info = SCREEN_INFO;    /* 显示参数 */
+ 	aux_device_present = AUX_DEVICE_INFO; /* 辅助设备 */
+
+	/* 第二阶段：内存配置和初始化 */
+	/* 计算总内存大小：1MB基本内存 + 扩展内存 */
 	memory_end = (1<<20) + (EXT_MEM_K<<10);
-	memory_end &= PAGE_MASK;
-	ramdisk_size = RAMDISK_SIZE;
+	memory_end &= PAGE_MASK;        /* 页面对齐 */
+	ramdisk_size = RAMDISK_SIZE;      /* RAM盘大小 */
+
+	/* 解析内核启动参数 */
 	copy_options(command_line,COMMAND_LINE);
+
+	/* 限制最大内存使用（16MB限制） */
 #ifdef CONFIG_MAX_16M
 	if (memory_end > 16*1024*1024)
 		memory_end = 16*1024*1024;
 #endif
+
+	/* 处理根文件系统挂载选项 */
 	if (MOUNT_ROOT_RDONLY)
 		root_mountflags |= MS_RDONLY;
+
+	/* 确定内核代码和数据的位置 */
 	if ((unsigned long)&end >= (1024*1024)) {
+		/* 内核超过1MB，从内核结束位置开始 */
 		memory_start = (unsigned long) &end;
 		low_memory_start = PAGE_SIZE;
 	} else {
+		/* 内核小于1MB，从1MB开始 */
 		memory_start = 1024*1024;
 		low_memory_start = (unsigned long) &end;
 	}
+
+	/* 第三阶段：核心系统初始化 */
+	/* 内存管理初始化：设置页表和分页机制 */
 	low_memory_start = PAGE_ALIGN(low_memory_start);
 	memory_start = paging_init(memory_start,memory_end);
+
+	/* 检测EISA总线 */
 	if (strncmp((char*)0x0FFFD9, "EISA", 4) == 0)
 		EISA_bus = 1;
-	trap_init();
-	init_IRQ();
-	sched_init();
+
+	/* 中断和异常处理初始化 */
+	trap_init();                 /* 设置中断描述符表 */
+	init_IRQ();                  /* 初始化中断控制器 */
+
+	/* 进程调度初始化 */
+	sched_init();                /* 初始化任务调度器 */
+
+	/* 再次解析启动参数（在调度器初始化后） */
 	parse_options(command_line);
+
+	/* 性能分析支持 */
 #ifdef CONFIG_PROFILE
 	prof_buffer = (unsigned long *) memory_start;
 	prof_len = (unsigned long) &end;
 	prof_len >>= 2;
 	memory_start += prof_len * sizeof(unsigned long);
 #endif
+
+	/* 第四阶段：内存和设备初始化 */
+	/* 内核内存分配器初始化 */
 	memory_start = kmalloc_init(memory_start,memory_end);
+
+	/* 字符设备初始化（控制台、串口等） */
 	memory_start = chr_dev_init(memory_start,memory_end);
+
+	/* 块设备初始化（硬盘、软盘等） */
 	memory_start = blk_dev_init(memory_start,memory_end);
+
+	/* 启用中断 */
 	sti();
+
+	/* 系统延迟校准 */
 	calibrate_delay();
+
+	/* 网络设备初始化 */
 #ifdef CONFIG_INET
 	memory_start = net_dev_init(memory_start,memory_end);
 #endif
+
+	/* SCSI设备初始化 */
 #ifdef CONFIG_SCSI
 	memory_start = scsi_dev_init(memory_start,memory_end);
 #endif
+
+	/* 第五阶段：文件系统和系统服务初始化 */
+	/* inode表初始化 */
 	memory_start = inode_init(memory_start,memory_end);
+
+	/* 文件表初始化 */
 	memory_start = file_table_init(memory_start,memory_end);
+
+	/* 内存管理最终初始化 */
 	mem_init(low_memory_start,memory_start,memory_end);
+
+	/* 缓冲区缓存初始化 */
 	buffer_init();
+
+	/* 系统时间初始化 */
 	time_init();
+
+	/* 软盘驱动初始化 */
 	floppy_init();
+
+	/* 网络协议栈初始化 */
 	sock_init();
+
+	/* System V IPC支持 */
 #ifdef CONFIG_SYSVIPC
 	ipc_init();
 #endif
+
+	/* 再次确保中断启用 */
 	sti();
 	
+	/* 第六阶段：数学协处理器检测 */
 	/*
-	 * check if exception 16 works correctly.. This is truly evil
-	 * code: it disables the high 8 interrupts to make sure that
-	 * the irq13 doesn't happen. But as this will lead to a lockup
-	 * if no exception16 arrives, it depends on the fact that the
-	 * high 8 interrupts will be re-enabled by the next timer tick.
-	 * So the irq13 will happen eventually, but the exception 16
-	 * should get there first..
+	 * 检查异常16是否正确工作。这是真正的恶意代码：
+	 * 它禁用高8中断以确保irq13不会发生。但如果异常16
+	 * 没有到达，这会导致死锁，因为它依赖于高8中断
+	 * 将在下一个时钟滴答中重新启用。所以irq13最终会发生，
+	 * 但异常16应该先到达。
 	 */
 	if (hard_math) {
 		unsigned short control_word;
 
 		printk("Checking 386/387 coupling... ");
+		
+		/* 设置定时器，用于检测数学协处理器异常 */
 		timer_table[COPRO_TIMER].expires = jiffies+50;
 		timer_table[COPRO_TIMER].fn = copro_timeout;
 		timer_active |= 1<<COPRO_TIMER;
+		
+		/* 保存FPU状态并执行测试除法 */
 		__asm__("clts ; fninit ; fnstcw %0 ; fwait":"=m" (*&control_word));
 		control_word &= 0xffc0;
-		__asm__("fldcw %0 ; fwait": :"m" (*&control_word));
+		__asm__("fldcw %0 ; fwait": "m" (*&control_word));
 		outb_p(inb_p(0x21) | (1 << 2), 0x21);
 		__asm__("fldz ; fld1 ; fdiv %st,%st(1) ; fwait");
+		
+		/* 清除定时器 */
 		timer_active &= ~(1<<COPRO_TIMER);
+		
 		if (!fpu_error)
 			printk("Ok, fpu using %s error reporting.\n",
-				ignore_irq13?"exception 16":"irq13");
+					ignore_irq13?"exception 16":"irq13");
 	}
 #ifndef CONFIG_MATH_EMULATION
 	else {
+		/* 没有数学协处理器且没有数学仿真 */
 		printk("No coprocessor found and no math emulation present.\n");
 		printk("Giving up.\n");
-		for (;;) ;
+		for (;;) ;  /* 无限循环，停止启动 */
 	}
 #endif
 
+	/* 第七阶段：用户空间启动 */
+	/* 显示Linux横幅信息 */
 	system_utsname.machine[1] = '0' + x86;
 	printk(linux_banner);
 
+	/* 切换到用户模式 */
 	move_to_user_mode();
-	if (!fork())		/* we count on this going ok */
+
+	/* 创建init进程（PID=1） */
+	if (!fork())		/* 我们指望这个正常进行 */
 		init();
-/*
- * task[0] is meant to be used as an "idle" task: it may not sleep, but
- * it might do some general things like count free pages or it could be
- * used to implement a reasonable LRU algorithm for the paging routines:
- * anything that can be useful, but shouldn't take time from the real
- * processes.
- *
- * Right now task[0] just does a infinite idle loop.
- */
+
+	/*
+	 * task[0]被用作"空闲"任务：它不能睡眠，但
+	 * 可能做一些通用的事情，如计算空闲页面或用于实现
+	 * 分页例程的合理LRU算法：
+	 * 任何有用的事情，但不应该占用真实进程的时间。
+	 *
+	 * 现在task[0]只是做一个无限空闲循环。
+	 */
 	for(;;)
 		idle();
 }
@@ -484,32 +586,76 @@ static int printf(const char *fmt, ...)
 	return i;
 }
 
+/*
+ * init() - 用户空间初始化函数（PID=1）
+ * 
+ * 功能：作为系统的第一个用户空间进程，负责完成系统启动和用户空间初始化
+ * 
+ * 启动流程：
+ * 1. 系统设置和基本环境配置
+ * 2. 尝试启动标准init程序
+ * 3. 如果标准init失败，启动备用初始化序列
+ * 4. 进入进程管理循环
+ * 
+ * 特点：
+ * - 这是内核启动的第一个用户空间进程（PID=1）
+ * - 永远不会退出，负责收养孤儿进程
+ * - 负责系统初始化和服务管理
+ * - 如果init进程死亡，系统通常会崩溃
+ * 
+ * 标准init程序搜索顺序：
+ * 1. /etc/init  - 传统的System V init
+ * 2. /bin/init  - 标准的init位置
+ * 3. /sbin/init - 系统管理员常用的位置
+ * 
+ * 备用初始化（如果标准init都不存在）：
+ * - 启动一个简单的shell脚本/etc/rc
+ * - 然后进入交互式shell（作为最后的手段）
+ */
 void init(void)
 {
 	int pid,i;
 
+	/* 第一阶段：基本系统设置 */
+	/* 执行系统设置，包括文件系统挂载等 */
 	setup((void *) &drive_info);
-	sprintf(term, "TERM=con%dx%d", ORIG_VIDEO_COLS, ORIG_VIDEO_LINES);
-	(void) open("/dev/tty1",O_RDWR,0);
-	(void) dup(0);
-	(void) dup(0);
 
-	execve("/etc/init",argv_init,envp_init);
-	execve("/bin/init",argv_init,envp_init);
-	execve("/sbin/init",argv_init,envp_init);
+	/* 设置终端环境变量 */
+	sprintf(term, "TERM=con%dx%d", ORIG_VIDEO_COLS, ORIG_VIDEO_LINES);
+
+	/* 打开标准输入、输出、错误设备 */
+	(void) open("/dev/tty1",O_RDWR,0);  /* 标准输入（文件描述符0） */
+	(void) dup(0);                      /* 标准输出（文件描述符1） */
+	(void) dup(0);                      /* 标准错误（文件描述符2） */
+
+	/* 第二阶段：尝试启动标准init程序 */
+	/* 按照传统Unix顺序尝试不同的init位置 */
+	execve("/etc/init",argv_init,envp_init);   /* 传统位置 */
+	execve("/bin/init",argv_init,envp_init);   /* 标准位置 */
+	execve("/sbin/init",argv_init,envp_init);  /* 系统管理员位置 */
+	/* 如果这些都失败，继续执行下面的备用初始化 */
 	/* if this fails, fall through to original stuff */
 
+	/* 第三阶段：备用初始化序列 */
+	/* 如果标准init程序都不存在，执行简单的初始化 */
 	if (!(pid=fork())) {
-		close(0);
-		if (open("/etc/rc",O_RDONLY,0))
-			_exit(1);
+		/* 子进程：执行系统启动脚本 */
+		close(0);  /* 关闭标准输入 */
+		if (open("/etc/rc",O_RDONLY,0))  /* 尝试打开启动脚本 */
+			_exit(1);  /* 如果失败，退出 */
+		/* 执行shell来运行启动脚本 */
 		execve("/bin/sh",argv_rc,envp_rc);
-		_exit(2);
+		_exit(2);  /* 如果execve失败，退出 */
 	}
+	/* 父进程：等待启动脚本完成 */
 	if (pid>0)
-		while (pid != wait(&i))
+		while (pid != wait(&i))  /* 等待子进程结束 */
 			/* nothing */;
+
+	/* 第四阶段：进入进程管理循环 */
+	/* 这个循环负责收养孤儿进程和提供登录服务 */
 	while (1) {
+		/* 尝试创建新的登录进程 */
 		if ((pid = fork()) < 0) {
 			printf("Fork failed in init\n\r");
 			continue;
