@@ -153,30 +153,46 @@ int NR_syscalls = sizeof(sys_call_table)/sizeof(fn_ptr);
 #endif
 
 /*
- *  'math_state_restore()' saves the current math information in the
- * old math state array, and gets the new ones from the current task
+ * math_state_restore - 数学协处理器状态恢复函数
+ * 将当前数学信息保存在旧的数学状态数组中，并从当前任务获取新的状态
+ * 
+ * 此函数在进程切换时被调用，用于恢复或初始化数学协处理器的状态
+ * 它实现了多任务环境下数学协处理器的状态管理，确保每个进程
+ * 都有独立的数学协处理器状态，避免进程间相互干扰
  *
- * Careful.. There are problems with IBM-designed IRQ13 behaviour.
- * Don't touch unless you *really* know how it works.
+ * 注意：IBM设计的IRQ13行为存在问题。
+ * 除非你真正了解它的工作原理，否则不要修改。
  */
 asmlinkage void math_state_restore(void)
 {
+	/* 清除任务切换标志(TS)，允许使用数学协处理器 */
 	__asm__ __volatile__("clts");
+	/* 如果当前任务已经是最后一个使用数学协处理器的任务，无需恢复 */
 	if (last_task_used_math == current)
-		return;
+		return;			/* 无需切换状态 */
+	/* 设置协处理器定时器，50个时钟节拍后触发 */
 	timer_table[COPRO_TIMER].expires = jiffies+50;
+	/* 激活协处理器定时器 */
 	timer_active |= 1<<COPRO_TIMER;	
+	/* 如果有上一个任务使用了数学协处理器，保存其状态 */
 	if (last_task_used_math)
+		/* 保存上一个任务的数学协处理器状态到其TSS中 */
 		__asm__("fnsave %0":"=m" (last_task_used_math->tss.i387));
 	else
+		/* 没有上一个任务，清除数学协处理器异常和状态 */
 		__asm__("fnclex");
+	/* 更新最后一个使用数学协处理器的任务为当前任务 */
 	last_task_used_math = current;
+	/* 检查当前任务是否已经使用过数学协处理器 */
 	if (current->used_math) {
+		/* 恢复当前任务的数学协处理器状态 */
 		__asm__("frstor %0": :"m" (current->tss.i387));
 	} else {
-		__asm__("fninit");
-		current->used_math=1;
+		/* 当前任务首次使用数学协处理器，初始化协处理器 */
+		__asm__("fninit");		/* 初始化数学协处理器 */
+		current->used_math=1;		/* 标记已使用数学协处理器 */
 	}
+	/* 清除协处理器定时器，完成状态切换 */
 	timer_active &= ~(1<<COPRO_TIMER);
 }
 
@@ -197,94 +213,127 @@ unsigned long itimer_next = ~0;
 static unsigned long lost_ticks = 0;
 
 /*
- *  'schedule()' is the scheduler function. It's a very simple and nice
- * scheduler: it's not perfect, but certainly works for most things.
- * The one thing you might take a look at is the signal-handler code here.
+ * schedule - 内核调度器函数
+ * 这是一个非常简单和优秀的调度器：它并不完美，但对于大多数情况
+ * 肯定是有效的。你可能需要关注的是这里的信号处理程序代码。
  *
- *   NOTE!!  Task 0 is the 'idle' task, which gets called when no other
- * tasks can run. It can not be killed, and it cannot sleep. The 'state'
- * information in task[0] is never used.
+ *   注意！！任务0是'空闲'任务，当没有其他任务可以运行时被调用。
+ * 它不能被杀死，也不能睡眠。任务0中的'state'信息从未被使用。
  *
- * The "confuse_gcc" goto is used only to get better assembly code..
- * Djikstra probably hates me.
+ * "confuse_gcc" goto仅用于获得更好的汇编代码..
+ * Djikstra可能讨厌我。
  */
 asmlinkage void schedule(void)
 {
-	int c;
-	struct task_struct * p;
-	struct task_struct * next;
-	unsigned long ticks;
+	int c;				/* 临时变量，用于存储最高计数器值 */
+	struct task_struct * p;		/* 任务结构体指针，用于遍历任务 */
+	struct task_struct * next;		/* 下一个要运行的任务 */
+	unsigned long ticks;			/* 临时存储定时器节拍数 */
 
-/* check alarm, wake up any interruptible tasks that have got a signal */
+/* 检查闹钟，唤醒任何收到信号的可中断任务 */
 
+	/* 关中断，保护共享数据 */
 	cli();
+	/* 获取自上次调度以来的定时器节拍数 */
 	ticks = itimer_ticks;
+	/* 重置全局定时器计数器 */
 	itimer_ticks = 0;
+	/* 设置下一个定时器触发时间为最大值 */
 	itimer_next = ~0;
+	/* 开中断 */
 	sti();
+	/* 清除需要重新调度标志 */
 	need_resched = 0;
+	/* 从init_task开始遍历任务列表 */
 	p = &init_task;
+	/* 无限循环，处理所有任务的定时器和信号 */
 	for (;;) {
+		/* 移动到下一个任务，如果回到init_task则退出循环 */
 		if ((p = p->next_task) == &init_task)
-			goto confuse_gcc1;
+			goto confuse_gcc1;	/* 用于优化GCC生成的代码 */
+		/* 处理实时定时器 */
 		if (ticks && p->it_real_value) {
+			/* 检查定时器是否已到期 */
 			if (p->it_real_value <= ticks) {
+				/* 发送SIGALRM信号给任务 */
 				send_sig(SIGALRM, p, 1);
+				/* 如果不是周期性定时器，清除定时器 */
 				if (!p->it_real_incr) {
 					p->it_real_value = 0;
 					goto end_itimer;
 				}
+				/* 计算下一次定时器触发时间 */
 				do {
 					p->it_real_value += p->it_real_incr;
 				} while (p->it_real_value <= ticks);
 			}
+			/* 减去已过去的节拍数 */
 			p->it_real_value -= ticks;
+			/* 更新全局下一个定时器触发时间 */
 			if (p->it_real_value < itimer_next)
 				itimer_next = p->it_real_value;
 		}
 end_itimer:
+		/* 只处理可中断状态的任务 */
 		if (p->state != TASK_INTERRUPTIBLE)
-			continue;
+			continue;		/* 跳过不可中断的任务 */
+		/* 检查任务是否有未阻塞的信号 */
 		if (p->signal & ~p->blocked) {
+			/* 将任务状态设置为运行中 */
 			p->state = TASK_RUNNING;
-			continue;
+			continue;		/* 继续处理下一个任务 */
 		}
+		/* 检查任务的超时是否已到期 */
 		if (p->timeout && p->timeout <= jiffies) {
+			/* 清除超时值 */
 			p->timeout = 0;
+			/* 将任务状态设置为运行中 */
 			p->state = TASK_RUNNING;
 		}
 	}
-confuse_gcc1:
+confuse_gcc1:		/* 用于优化GCC生成的代码 */
 
-/* this is the scheduler proper: */
+/* 这是调度器的核心部分： */
 #if 0
-	/* give processes that go to sleep a bit higher priority.. */
-	/* This depends on the values for TASK_XXX */
-	/* This gives smoother scheduling for some things, but */
-	/* can be very unfair under some circumstances, so.. */
+	/* 给进入睡眠的进程稍高优先级.. */
+	/* 这取决于TASK_XXX的值 */
+	/* 这对某些事情提供更平滑的调度，但 */
+	/* 在某些情况下可能非常不公平，所以.. */
  	if (TASK_UNINTERRUPTIBLE >= (unsigned) current->state &&
 	    current->counter < current->priority*2) {
 		++current->counter;
 	}
 #endif
+	/* 初始化最高计数器值 */
 	c = -1;
+	/* 初始化下一个要运行的任务和当前任务指针 */
 	next = p = &init_task;
+	/* 遍历所有任务，寻找具有最高计数器的可运行任务 */
 	for (;;) {
+		/* 移动到下一个任务，如果回到init_task则退出循环 */
 		if ((p = p->next_task) == &init_task)
-			goto confuse_gcc2;
+			goto confuse_gcc2;	/* 用于优化GCC生成的代码 */
+		/* 如果任务处于运行状态且计数器值更高，则选择它 */
 		if (p->state == TASK_RUNNING && p->counter > c)
-			c = p->counter, next = p;
+			c = p->counter, next = p;	/* 更新最高计数器和下一个任务 */
 	}
-confuse_gcc2:
+confuse_gcc2:		/* 用于优化GCC生成的代码 */
+	/* 如果所有可运行任务的计数器都为0，需要重新计算 */
 	if (!c) {
+		/* 为所有任务重新计算计数器值 */
 		for_each_task(p)
+			/* 计数器 = (旧计数器/2) + 优先级 */
 			p->counter = (p->counter >> 1) + p->priority;
 	}
+	/* 如果下一个任务不是当前任务，需要上下文切换 */
 	if(current != next)
+		/* 增加上下文切换计数器 */
 		kstat.context_swtch++;
+	/* 执行上下文切换，切换到下一个任务 */
 	switch_to(next);
-	/* Now maybe reload the debug registers */
+	/* 现在可能需要重新加载调试寄存器 */
 	if(current->debugreg[7]){
+		/* 加载调试寄存器0-3和6 */
 		loaddebug(0);
 		loaddebug(1);
 		loaddebug(2);
@@ -293,46 +342,70 @@ confuse_gcc2:
 	};
 }
 
+/*
+ * sys_pause - 进程暂停系统调用
+ * 使当前进程进入可中断睡眠状态，直到收到信号为止
+ * 
+ * 此函数实现POSIX pause()系统调用，用于暂停进程执行
+ * 进程将保持睡眠状态，直到收到信号处理程序返回
+ * 
+ * 返回值: 总是返回-ERESTARTNOHAND，表示系统调用需要重启
+ *          (当信号处理程序返回时，内核会自动重启系统调用)
+ */
 asmlinkage int sys_pause(void)
 {
+	/* 将当前进程状态设置为可中断睡眠 */
 	current->state = TASK_INTERRUPTIBLE;
+	/* 调用调度器，选择其他进程运行 */
 	schedule();
+	/* 返回-ERESTARTNOHAND，表示系统调用需要重启 */
 	return -ERESTARTNOHAND;
 }
 
 /*
- * wake_up doesn't wake up stopped processes - they have to be awakened
- * with signals or similar.
+ * wake_up - 唤醒等待队列中的进程
+ * 注意：此函数不会唤醒已停止的进程 - 它们必须通过信号或类似方式唤醒
  *
- * Note that this doesn't need cli-sti pairs: interrupts may not change
- * the wait-queue structures directly, but only call wake_up() to wake
- * a process. The process itself must remove the queue once it has woken.
+ * 注意：此函数不需要cli-sti对：中断不能直接更改等待队列结构，
+ * 只能调用wake_up()来唤醒进程。进程本身在唤醒后必须从队列中移除。
+ * 
+ * 参数:
+ * q - 指向等待队列头指针的指针
  */
 void wake_up(struct wait_queue **q)
 {
-	struct wait_queue *tmp;
-	struct task_struct * p;
+	struct wait_queue *tmp;	/* 临时指针，用于遍历等待队列 */
+	struct task_struct * p;	/* 任务结构体指针 */
 
+	/* 检查等待队列指针和队列是否有效 */
 	if (!q || !(tmp = *q))
-		return;
+		return;			/* 无效队列，直接返回 */
+	/* 遍历环形等待队列中的所有任务 */
 	do {
+		/* 获取等待队列项中的任务指针 */
 		if ((p = tmp->task) != NULL) {
+			/* 检查任务是否处于可唤醒状态 */
 			if ((p->state == TASK_UNINTERRUPTIBLE) ||
 			    (p->state == TASK_INTERRUPTIBLE)) {
+				/* 将任务状态设置为运行中 */
 				p->state = TASK_RUNNING;
+				/* 如果被唤醒任务的优先级高于当前任务，设置需要重新调度标志 */
 				if (p->counter > current->counter)
 					need_resched = 1;
 			}
 		}
+		/* 检查等待队列链表的完整性 */
 		if (!tmp->next) {
+			/* 打印等待队列错误信息 */
 			printk("wait_queue is bad (eip = %08lx)\n",((unsigned long *) q)[-1]);
 			printk("        q = %p\n",q);
 			printk("       *q = %p\n",*q);
 			printk("      tmp = %p\n",tmp);
-			break;
+			break;		/* 退出循环 */
 		}
+		/* 移动到下一个等待队列项 */
 		tmp = tmp->next;
-	} while (tmp != *q);
+	} while (tmp != *q);	/* 循环直到回到队列头部 */
 }
 
 void wake_up_interruptible(struct wait_queue **q)
@@ -810,32 +883,51 @@ void show_state(void)
 			show_task(i,task[i]);
 }
 
+/*
+ * sched_init - 调度器初始化函数
+ * 初始化内核调度器和定时器，设置必要的描述符和中断处理程序
+ * 此函数在系统启动时被调用，完成多任务环境的基础设置
+ */
 void sched_init(void)
 {
-	int i;
-	struct desc_struct * p;
+	int i;				/* 循环计数器 */
+	struct desc_struct * p;		/* 描述符结构体指针 */
 
+	/* 设置定时器底半处理程序 */
 	bh_base[TIMER_BH].routine = timer_bh;
+	/* 检查sigaction结构体大小是否为16字节 */
 	if (sizeof(struct sigaction) != 16)
-		panic("Struct sigaction MUST be 16 bytes");
+		panic("Struct sigaction MUST be 16 bytes");	/* 结构体大小错误 */
+	/* 在GDT中设置init任务的TSS描述符 */
 	set_tss_desc(gdt+FIRST_TSS_ENTRY,&init_task.tss);
+	/* 在GDT中设置默认LDT描述符 */
 	set_ldt_desc(gdt+FIRST_LDT_ENTRY,&default_ldt,1);
+	/* 设置系统调用中断门(0x80) */
 	set_system_gate(0x80,&system_call);
-	p = gdt+2+FIRST_TSS_ENTRY;
+	/* 初始化GDT中剩余的任务描述符 */
+	p = gdt+2+FIRST_TSS_ENTRY;	/* 指向第一个可用的TSS描述符 */
+	/* 遍历所有可能的任务槽位 */
 	for(i=1 ; i<NR_TASKS ; i++) {
+		/* 清空任务指针 */
 		task[i] = NULL;
+		/* 清空TSS描述符 */
 		p->a=p->b=0;
-		p++;
+		p++;				/* 移动到下一个描述符 */
+		/* 清空LDT描述符 */
 		p->a=p->b=0;
-		p++;
+		p++;				/* 移动到下一个描述符 */
 	}
-/* Clear NT, so that we won't have troubles with that later on */
+/* 清除EFLAGS中的NT标志，避免后续出现问题 */
 	__asm__("pushfl ; andl $0xffffbfff,(%esp) ; popfl");
+	/* 加载任务0的TSS */
 	load_TR(0);
+	/* 加载任务0的LDT */
 	load_ldt(0);
-	outb_p(0x34,0x43);		/* binary, mode 2, LSB/MSB, ch 0 */
-	outb_p(LATCH & 0xff , 0x40);	/* LSB */
-	outb(LATCH >> 8 , 0x40);	/* MSB */
+	/* 初始化8253/8254可编程间隔定时器 */
+	outb_p(0x34,0x43);		/* 二进制模式，模式2，LSB/MSB，通道0 */
+	outb_p(LATCH & 0xff , 0x40);	/* 写入低字节 */
+	outb(LATCH >> 8 , 0x40);	/* 写入高字节 */
+	/* 请求定时器中断 */
 	if (request_irq(TIMER_IRQ,(void (*)(int)) do_timer)!=0)
-		panic("Could not allocate timer IRQ!");
+		panic("Could not allocate timer IRQ!");	/* 定时器IRQ分配失败 */
 }
