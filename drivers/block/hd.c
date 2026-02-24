@@ -101,20 +101,65 @@ unsigned long read_timer(void)
 }
 #endif
 
+/*
+ * 硬盘参数设置函数（内核命令行参数处理）
+ * 
+ * 功能：从内核启动参数解析硬盘几何参数并设置对应的硬盘信息
+ * 
+ * 参数说明：
+ *   str  - 未使用的参数字符串（保留）
+ *   ints - 整数参数数组，格式为：[个数, 柱面数, 磁头数, 扇区数]
+ *          ints[0] = 3（表示有3个有效参数）
+ *          ints[1] = 柱面数（cylinders）
+ *          ints[2] = 磁头数（heads）  
+ *          ints[3] = 扇区数（sectors）
+ * 
+ * 使用场景：
+ * 内核启动时通过命令行参数指定硬盘参数，例如：
+ * hd=cyl,head,sect
+ * 
+ * 典型调用：
+ * 在系统启动时，由内核参数解析器调用
+ * 
+ * 支持的硬盘类型：
+ * - 第一块硬盘（hd0）
+ * - 第二块硬盘（hd1）
+ * 
+ * 注意：此函数只在系统初始化时调用一次，用于设置硬盘控制器参数
+ */
 void hd_setup(char *str, int *ints)
 {
 	int hdind = 0;
 
+	/* 验证参数个数是否正确（需要3个参数：柱面、磁头、扇区） */
 	if (ints[0] != 3)
 		return;
+
+	/* 确定要设置的硬盘索引：
+	 * 如果第一块硬盘已定义（head!=0），则设置第二块硬盘
+	 * 否则设置第一块硬盘 */
 	if (hd_info[0].head != 0)
 		hdind=1;
-	hd_info[hdind].head = ints[2];
-	hd_info[hdind].sect = ints[3];
-	hd_info[hdind].cyl = ints[1];
+
+	/* 设置硬盘几何参数 */
+	hd_info[hdind].head = ints[2];  /* 磁头数 */
+	hd_info[hdind].sect = ints[3];  /* 每磁道扇区数 */
+	hd_info[hdind].cyl = ints[1];  /* 柱面数 */
+
+	/* 设置写前补偿参数（ cylinders to start write precompensation）
+	 * 对于现代硬盘通常设置为0，表示不需要写前补偿 */
 	hd_info[hdind].wpcom = 0;
+
+	/* 设置着陆区柱面（landing zone cylinder）
+	 * 磁头停放位置，通常设置为最大柱面数 */
 	hd_info[hdind].lzone = ints[1];
+
+	/* 设置控制字节：
+	 * 如果磁头数>8，设置位3（CTL_4HEAD），使用4头模式
+	 * 否则设置为0，使用8头模式 */
 	hd_info[hdind].ctl = (ints[2] > 8 ? 8 : 0);
+
+	/* 更新系统中硬盘总数计数器 */
 	NR_HD = hdind+1;
 }
 
@@ -794,4 +839,3 @@ static int revalidate_hddisk(int dev, int maxusage)
 	wake_up(&busy_wait);
 	return 0;
 }
-

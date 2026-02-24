@@ -307,34 +307,82 @@ asmlinkage int sys_umount(char * name)
  * We also have to flush all inode-data for this device, as the new mount
  * might need new info.
  */
+/*
+ * 执行实际的文件系统挂载操作
+ * 
+ * 功能：将指定设备上的文件系统挂载到目标目录
+ * 
+ * 参数：
+ *   dev  - 设备号（对于需要设备的文件系统）
+ *   dir  - 挂载点路径（目标目录）
+ *   type - 文件系统类型名称
+ *   flags- 挂载标志（如MS_RDONLY等）
+ *   data - 文件系统特定的挂载选项
+ * 
+ * 返回值：
+ *   0      - 挂载成功
+ *   -EBUSY - 挂载点忙（已挂载或正在使用）
+ *   -EPERM - 权限不足（挂载点不是目录）
+ *   其他   - 由子函数返回的错误码
+ * 
+ * 注意：此函数不释放dir_i的引用计数，这是为了在卸载时
+ * 能够通过i_mount字段找到对应的超级块
+ */
 static int do_mount(dev_t dev, const char * dir, char * type, int flags, void * data)
 {
 	struct inode * dir_i;
 	struct super_block * sb;
 	int error;
 
+	/* 第一步：解析挂载点路径，获取挂载点目录的inode
+	 * namei函数将路径名转换为对应的inode结构 */
 	error = namei(dir,&dir_i);
 	if (error)
 		return error;
+
+	/* 第二步：验证挂载点的有效性
+	 * 检查条件：
+	 * 1. i_count == 1：确保挂载点只有当前引用（未被打开）
+	 * 2. i_mount == 0：确保挂载点未被挂载其他文件系统 */
 	if (dir_i->i_count != 1 || dir_i->i_mount) {
 		iput(dir_i);
 		return -EBUSY;
 	}
+
+	/* 第三步：验证挂载点类型
+	 * 确保挂载点是目录，而不是普通文件或其他类型 */
 	if (!S_ISDIR(dir_i->i_mode)) {
 		iput(dir_i);
 		return -EPERM;
 	}
+
+	/* 第四步：检查设备是否可以被挂载
+	 * fs_may_mount检查设备上是否有打开的文件或脏缓冲区 */
 	if (!fs_may_mount(dev)) {
 		iput(dir_i);
 		return -EBUSY;
 	}
+
+	/* 第五步：读取并初始化文件系统超级块
+	 * read_super函数负责：
+	 * 1. 调用具体文件系统的read_super方法
+	 * 2. 验证文件系统完整性
+	 * 3. 初始化超级块结构 */
 	sb = read_super(dev,type,flags,data,0);
 	if (!sb || sb->s_covered) {
 		iput(dir_i);
 		return -EBUSY;
 	}
+
+	/* 第六步：建立挂载关系
+	 * 1. 将挂载点inode记录到超级块的s_covered字段
+	 * 2. 将超级块的根inode记录到挂载点的i_mount字段
+	 * 这样形成了双向引用，便于卸载时查找和清理 */
 	sb->s_covered = dir_i;
 	dir_i->i_mount = sb->s_mounted;
+
+	/* 成功返回，注意：不释放dir_i的引用计数
+	 * 这是为了在卸载文件系统时能够通过i_mount找到对应的超级块 */
 	return 0;		/* we don't iput(dir_i) - see umount */
 }
 
@@ -380,6 +428,11 @@ static int do_remount(const char *dir,int flags,char *data)
 	return retval;
 }
 
+/**
+ * @brief 
+ * data: 指向用户空间的挂载选项字符串指针
+ * where: 输出参数，用于存储分配的内核空间页面地址
+ */
 static int copy_mount_options (const void * data, unsigned long *where)
 {
 	int i;
@@ -390,6 +443,9 @@ static int copy_mount_options (const void * data, unsigned long *where)
 	if (!data)
 		return 0;
 
+	// 地址空间验证, 遍历当前进程的虚拟内存区域(VMA)链表,
+	// 验证用户提供的地址是否有效, 防止访问非法内存
+	// 确保 data 指针指向的内存属于当前进程的地址空间
 	for (vma = current->mmap ; ; ) {
 		if (!vma ||
 		    (unsigned long) data < vma->vm_start) {
@@ -399,12 +455,17 @@ static int copy_mount_options (const void * data, unsigned long *where)
 			break;
 		vma = vma->vm_next;
 	}
+
+	// 计算 data 到当前VMA结束的字节数, 限制做大复制长度为 PAGE_SIZE-1
+	// 防止用户空间传递过大的数据导致内核内存耗尽
 	i = vma->vm_end - (unsigned long) data;
 	if (PAGE_SIZE <= (unsigned long) i)
 		i = PAGE_SIZE-1;
+	// 分配一个内存页用于存储挂载选项
 	if (!(page = __get_free_page(GFP_KERNEL))) {
 		return -ENOMEM;
 	}
+	// 从用户空间复制数据到内核空间, 将分配的页面地址通过 where 返回
 	memcpy_fromfs((void *) page,data,i);
 	*where = page;
 	return 0;
@@ -449,14 +510,22 @@ asmlinkage int sys_mount(char * dev_name, char * dir_name, char * type,
 		free_page(page);
 		return retval;
 	}
+
+	// 把用户传入的 数据 复制到 page
 	retval = copy_mount_options (type, &page);
 	if (retval < 0)
 		return retval;
+
+	// 根据用户传入的文件系统类型, 获取到对应的 struct file_system_type 结构体
 	fstype = get_fs_type((char *) page);
 	free_page(page);
 	if (!fstype)		
 		return -ENODEV;
+
+	// 文件系统类型名字
 	t = fstype->name;
+
+	// 需要块设备
 	if (fstype->requires_dev) {
 		retval = namei(dev_name,&inode);
 		if (retval)

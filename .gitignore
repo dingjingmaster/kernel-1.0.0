@@ -1,3 +1,6 @@
+.depend
+ksyms.lst
+.marscode/
 # Prerequisites
 *.d
 
