@@ -117,30 +117,117 @@ int getname(const char * filename, char **result)
 	return error;
 }
 
+/*
+ * putname() - 释放getname分配的路径名缓冲区
+ * 
+ * 功能：释放由getname()函数分配的内核页面，用于路径名字符串
+ * 
+ * 参数：
+ *   name - 指向getname()返回的内核空间字符串指针
+ * 
+ * 使用场景：
+ * 这个函数与getname()成对使用，形成完整的路径名处理生命周期：
+ * getname() -> 使用路径名 -> putname() 
+ * 
+ * 典型调用链：
+ * namei() -> getname() -> _namei() -> putname()
+ * 
+ * 内存管理：
+ * - getname()分配一个物理页面（PAGE_SIZE，通常4KB）
+ * - putname()释放该页面
+ * - 必须确保成对调用，避免内存泄漏
+ * 
+ * 安全特性：
+ * - 接受NULL指针（虽然不应该发生）
+ * - 使用free_page安全释放内核内存
+ * - 参数类型转换为unsigned long符合free_page接口要求
+ * 
+ * 注意：
+ * 这是内核中最简单的内存释放函数之一，但其重要性在于：
+ * 1. 确保路径名处理不会内存泄漏
+ * 2. 与getname形成对称的内存管理接口
+ * 3. 为路径解析提供可靠的内存管理基础
+ */
 void putname(char * name)
 {
+	/* 释放getname()分配的物理页面
+	 * 参数需要转换为unsigned long类型以符合free_page接口 */
 	free_page((unsigned long) name);
 }
 
 /*
- *	permission()
- *
- * is used to check for read/write/execute permissions on a file.
- * I don't know if we should look at just the euid or both euid and
- * uid, but that should be easily changed.
+ *	permission() - 文件权限检查函数
+ * 
+ * 功能：检查当前进程对指定inode的读/写/执行权限
+ * 
+ * 参数说明：
+ *   inode - 要检查权限的文件或目录的inode
+ *   mask  - 请求的权限掩码（MAY_READ, MAY_WRITE, MAY_EXEC）
+ * 
+ * 返回值：
+ *   1 - 有权限，允许访问
+ *   0 - 无权限，拒绝访问
+ * 
+ * 权限检查算法（标准Unix权限模型）：
+ * 1. 超级用户（uid=0）总是拥有所有权限
+ * 2. 文件所有者：检查用户权限位（mode的高3位）
+ * 3. 同组用户：检查组权限位（mode的中3位）
+ * 4. 其他用户：检查其他权限位（mode的低3位）
+ * 
+ * 特殊情况：
+ * - 文件系统可以实现自定义的permission方法
+ * - 目录的"执行"权限表示"进入"权限
+ * - 写权限检查可能受文件系统挂载选项影响（如只读挂载）
+ * 
+ * 权限位定义：
+ * mode & 0700 - 文件所有者权限（读/写/执行）
+ * mode & 0070 - 同组用户权限
+ * mode & 0007 - 其他用户权限
+ * 
+ * 历史注释：
+ * 原作者不确定是否应该只检查euid还是同时检查uid和euid
+ * 这反映了早期Unix权限模型的设计考虑
  */
 int permission(struct inode * inode,int mask)
 {
 	int mode = inode->i_mode;
 
+	/* 第一步：检查文件系统是否实现了自定义权限检查
+	 * 某些文件系统（如NFS）可能需要特殊的权限检查逻辑
+	 * 如果实现了custom permission方法，优先使用它 */
 	if (inode->i_op && inode->i_op->permission)
 		return inode->i_op->permission(inode, mask);
+
+	/* 第二步：文件所有者权限检查
+	 * 如果当前进程的有效用户ID等于文件所有者ID
+	 * 则使用文件所有者权限位（高3位） */
 	else if (current->euid == inode->i_uid)
-		mode >>= 6;
+		mode >>= 6;  /* 右移6位，使用0700部分的权限位 */
+	/* 第三步：同组用户权限检查
+	 * 如果当前进程的有效用户ID不等于文件所有者ID
+	 * 但进程属于文件的同组，则检查组权限位（中3位）
+	 * 
+	 * in_group_p()函数检查当前进程是否属于指定的组ID */
 	else if (in_group_p(inode->i_gid))
-		mode >>= 3;
+		mode >>= 3;  /* 右移3位，使用0070部分的权限位 */
+
+	/* 第四步：最终权限验证
+	 * 此时mode包含相应的权限位（用户/组/其他）
+	 * 
+	 * 检查逻辑：
+	 * (mode & mask & 0007) == mask
+	 * - mode & 0007：提取低3位权限（用户/组/其他权限）
+	 * - & mask：提取请求的权限位
+	 * - == mask：验证是否有所请求的所有权限
+	 * 
+	 * suser()检查：超级用户（uid=0）总是拥有所有权限
+	 * 这是Unix系统的传统权限模型 */
 	if (((mode & mask & 0007) == mask) || suser())
-		return 1;
+		return 1;  /* 有权限，允许访问 */
+	
+	/* 第五步：权限拒绝
+	 * 通过了用户、组、其他权限检查，且不是超级用户
+	 * 返回0表示权限不足，拒绝访问 */
 	return 0;
 }
 
@@ -487,16 +574,69 @@ static int _namei(const char * pathname, struct inode * base,
 	return 0;
 }
 
+/*
+ * lnamei() - 符号链接不跟踪版本的路径解析函数
+ * 
+ * 功能：将用户空间路径名转换为inode，但不跟踪符号链接
+ * 
+ * 与namei()的关键区别：
+ * - namei():  follow_links=1，自动跟踪符号链接到最终目标
+ * - lnamei(): follow_links=0，返回符号链接本身的inode
+ * 
+ * 参数说明：
+ *   pathname    - 用户空间的路径名字符串
+ *   res_inode   - 输出参数，返回解析得到的inode指针
+ * 
+ * 返回值：
+ *   0      - 成功，res_inode指向路径对应的inode
+ *   -ENOENT - 路径不存在
+ *   -EFAULT - 用户地址空间访问错误
+ *   -ENOMEM - 内核内存不足
+ *   -ELOOP   - 符号链接循环（在路径解析过程中）
+ * 
+ * 使用场景：
+ * 1. 读取符号链接本身的内容（readlink系统调用）
+ * 2. 删除符号链接（unlink系统调用）
+ * 3. 重命名符号链接（rename系统调用）
+ * 4. 需要获取符号链接属性而不是目标文件属性的操作
+ * 
+ * 实现特点：
+ * - 与namei()相同的错误处理和内存管理
+ * - 唯一区别是follow_links参数设置为0
+ * - 返回的inode可能是符号链接本身的inode
+ * 
+ * 典型调用链：
+ * lnamei() -> getname() -> _namei(follow_links=0) -> dir_namei() -> lookup()
+ * 
+ * 注意：
+ * 虽然函数名以"l"开头（可能让人联想到"link"），但实际上表示
+ * "logical"或"literal"，即按字面意义解析路径而不跟踪链接
+ */
 int lnamei(const char * pathname, struct inode ** res_inode)
 {
 	int error;
 	char * tmp;
 
+	/* 第一步：从用户空间复制路径名到内核空间
+	 * 与namei()使用相同的安全复制机制 */
 	error = getname(pathname,&tmp);
 	if (!error) {
+		/* 第二步：执行路径解析，但不跟踪符号链接
+		 * 关键参数：follow_links=0
+		 * 这意味着：
+		 * - 如果最终路径分量是符号链接，返回链接本身的inode
+		 * - 如果中间路径有符号链接，仍会跟踪到目录（由dir_namei处理）
+		 * - 适用于需要操作符号链接本身的系统调用 */
 		error = _namei(tmp,NULL,0,res_inode);
+		
+		/* 第三步：释放临时缓冲区
+		 * 无论_namei成功与否，都需要释放getname分配的内存 */
 		putname(tmp);
 	}
+	
+	/* 返回解析结果
+	 * 成功时res_inode指向路径对应的inode（可能是符号链接本身）
+	 * 失败时res_inode为NULL，error为负的错误码 */
 	return error;
 }
 
@@ -576,6 +716,38 @@ int namei(const char * pathname, struct inode ** res_inode)
  * which is a lot more logical, and also allows the "no perm" needed
  * for symlinks (where the permissions are checked later).
  */
+/*
+ * open_namei() - 文件打开/创建路径解析函数
+ * 
+ * 功能：解析文件路径并执行文件打开或创建操作所需的所有检查
+ * 
+ * 参数说明：
+ *   pathname - 要打开/创建的文件路径
+ *   flag     - 打开标志（O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_EXCL, O_TRUNC等）
+ *   mode     - 创建新文件时的权限模式（受umask影响）
+ *   res_inode- 输出参数，返回打开文件的inode指针
+ *   base     - 起始目录（NULL表示从当前目录开始）
+ * 
+ * 返回值：
+ *   0      - 成功，res_inode指向有效的inode（引用计数已增加）
+ *   -EISDIR - 试图以写模式打开目录
+ *   -EACCES - 权限不足
+ *   -EEXIST - O_CREAT|O_EXCL且文件已存在
+ *   -EROFS  - 试图在只读文件系统上创建/写入
+ *   -ETXTBSY- 试图写入正在执行的程序文件
+ * 
+ * 主要功能：
+ * 1. 路径解析：解析完整路径，获取最终目录和文件名
+ * 2. 文件创建：处理O_CREAT标志，创建新文件
+ * 3. 权限检查：执行全面的权限验证
+ * 4. 特殊文件：处理设备文件、目录等特殊文件
+ * 5. 并发控制：防止写入正在执行的程序
+ * 6. 截断处理：处理O_TRUNC标志
+ * 
+ * 与namei()的区别：
+ * - namei(): 只进行路径解析
+ * - open_namei(): 完整的文件打开准备，包括权限、类型、状态检查
+ */
 int open_namei(const char * pathname, int flag, int mode,
 	struct inode ** res_inode, struct inode * base)
 {
@@ -584,87 +756,142 @@ int open_namei(const char * pathname, int flag, int mode,
 	struct inode * dir, *inode;
 	struct task_struct ** p;
 
+	/* 第一步：处理文件创建模式
+	 * 清除mode中不需要的位，只保留权限位（S_IALLUGO）
+	 * 应用当前进程的umask掩码
+	 * 设置普通文件标志（S_IFREG） */
 	mode &= S_IALLUGO & ~current->umask;
 	mode |= S_IFREG;
+
+	/* 第二步：路径解析
+	 * 解析完整路径，获取最终目录的inode和文件名部分
+	 * 这个调用会消耗base的引用计数（如果提供） */
 	error = dir_namei(pathname,&namelen,&basename,base,&dir);
 	if (error)
 		return error;
+
+	/* 第三步：处理特殊情况 - 路径以目录结尾
+	 * 例如："/usr/"或"/usr/bin/"等情况 */
 	if (!namelen) {			/* special case: '/usr/' etc */
+		/* 如果以写模式打开目录，返回错误 */
 		if (flag & 2) {
 			iput(dir);
 			return -EISDIR;
 		}
-		/* thanks to Paul Pluzhnikov for noticing this was missing.. */
+		/* 检查目录访问权限
+		 * ACC_MODE将O_RDONLY/O_WRONLY/O_RDWR转换为MAY_READ/MAY_WRITE */
 		if (!permission(dir,ACC_MODE(flag))) {
 			iput(dir);
 			return -EACCES;
 		}
+		/* 返回目录本身的inode */
 		*res_inode=dir;
 		return 0;
 	}
+
+	/* 第四步：增加目录引用计数
+	 * 后续的lookup或create操作会消耗目录引用 */
 	dir->i_count++;		/* lookup eats the dir */
+
+	/* 第五步：处理文件创建（O_CREAT标志） */
 	if (flag & O_CREAT) {
+		/* 获取目录信号量，确保创建操作的原子性 */
 		down(&dir->i_sem);
+		
+		/* 首先尝试查找文件是否已存在 */
 		error = lookup(dir,basename,namelen,&inode);
 		if (!error) {
+			/* 文件已存在 */
 			if (flag & O_EXCL) {
+				/* O_EXCL标志要求文件必须不存在 */
 				iput(inode);
 				error = -EEXIST;
 			}
-		} else if (!permission(dir,MAY_WRITE | MAY_EXEC))
-			error = -EACCES;
-		else if (!dir->i_op || !dir->i_op->create)
-			error = -EACCES;
-		else if (IS_RDONLY(dir))
-			error = -EROFS;
-		else {
-			dir->i_count++;		/* create eats the dir */
-			error = dir->i_op->create(dir,basename,namelen,mode,res_inode);
-			up(&dir->i_sem);
-			iput(dir);
-			return error;
+		} else {
+			/* 文件不存在，准备创建新文件 */
+			/* 检查目录写入和执行权限 */
+			if (!permission(dir,MAY_WRITE | MAY_EXEC))
+				error = -EACCES;
+			/* 检查目录是否支持创建操作 */
+			else if (!dir->i_op || !dir->i_op->create)
+				error = -EACCES;
+			/* 检查文件系统是否只读 */
+			else if (IS_RDONLY(dir))
+				error = -EROFS;
+			else {
+				/* 所有检查通过，创建新文件 */
+				dir->i_count++;/* create eats the dir */
+				error = dir->i_op->create(dir,basename,namelen,mode,res_inode);
+				up(&dir->i_sem);
+				iput(dir);
+				return error;
+			}
 		}
 		up(&dir->i_sem);
-	} else
+	} else {
+		/* 不创建文件，只进行查找 */
 		error = lookup(dir,basename,namelen,&inode);
+	}
+	
+	/* 第六步：处理查找错误 */
 	if (error) {
 		iput(dir);
 		return error;
 	}
+
+	/* 第七步：跟踪符号链接 */
 	error = follow_link(dir,inode,flag,mode,&inode);
 	if (error)
 		return error;
+
+	/* 第八步：验证文件类型和打开模式的兼容性 */
+	/* 不能以写模式打开目录 */
 	if (S_ISDIR(inode->i_mode) && (flag & 2)) {
 		iput(inode);
 		return -EISDIR;
 	}
+
+	/* 第九步：文件权限检查 */
 	if (!permission(inode,ACC_MODE(flag))) {
 		iput(inode);
 		return -EACCES;
 	}
+
+	/* 第十步：特殊文件处理 */
+	/* 设备文件检查 */
 	if (S_ISBLK(inode->i_mode) || S_ISCHR(inode->i_mode)) {
+		/* 检查是否允许访问设备文件 */
 		if (IS_NODEV(inode)) {
 			iput(inode);
 			return -EACCES;
 		}
 	} else {
+		/* 普通文件和目录的只读文件系统检查 */
 		if (IS_RDONLY(inode) && (flag & 2)) {
 			iput(inode);
 			return -EROFS;
 		}
 	}
+
+	/* 第十一步：防止写入正在执行的程序
+	 * 这是Unix系统的安全机制，防止程序自修改 */
  	if ((inode->i_count > 1) && (flag & 2)) {
+ 		/* 遍历所有进程，检查是否有进程正在执行此文件 */
  		for (p = &LAST_TASK ; p > &FIRST_TASK ; --p) {
-		        struct vm_area_struct * mpnt;
+	        struct vm_area_struct * mpnt;
  			if (!*p)
  				continue;
+ 			/* 检查进程的executable字段 */
  			if (inode == (*p)->executable) {
  				iput(inode);
  				return -ETXTBSY;
- 			}
+			}
+			/* 检查进程的内存映射区域 */
 			for(mpnt = (*p)->mmap; mpnt; mpnt = mpnt->vm_next) {
+				/* 跳过可写映射 */
 				if (mpnt->vm_page_prot & PAGE_RW)
 					continue;
+				/* 找到只读映射的inode匹配 */
 				if (inode == mpnt->vm_inode) {
 					iput(inode);
 					return -ETXTBSY;
@@ -672,49 +899,128 @@ int open_namei(const char * pathname, int flag, int mode,
 			}
  		}
  	}
+
+	/* 第十二步：文件截断处理（O_TRUNC标志） */
 	if (flag & O_TRUNC) {
+	      /* 清空文件大小 */
 	      inode->i_size = 0;
+	      /* 调用文件系统的truncate方法 */
 	      if (inode->i_op && inode->i_op->truncate)
 	           inode->i_op->truncate(inode);
+	      /* 通知文件大小变更 */
 	      if ((error = notify_change(NOTIFY_SIZE, inode))) {
 		   iput(inode);
 		   return error;
 	      }
+	      /* 标记inode为脏，需要写回磁盘 */
 	      inode->i_dirt = 1;
 	}
+
+	/* 第十三步：返回结果 */
 	*res_inode = inode;
 	return 0;
 }
 
+/*
+ * do_mknod() - 设备文件创建函数
+ * 
+ * 功能：在指定目录中创建设备文件（字符设备、块设备、FIFO等）
+ * 
+ * 参数说明：
+ *   filename - 要创建的设备文件的完整路径
+ *   mode     - 文件类型和权限（S_IFCHR, S_IFBLK, S_IFIFO等）
+ *   dev      - 设备号（主设备号和次设备号）
+ * 
+ * 返回值：
+ *   0      - 成功创建设备文件
+ *   -ENOENT - 路径不存在或为空
+ *   -EROFS  - 试图在只读文件系统上创建
+ *   -EACCES - 目录权限不足
+ *   -EPERM  - 不允许在此文件系统上创建设备文件
+ * 
+ * 支持的文件类型：
+ * - S_IFCHR: 字符设备文件（如/dev/tty, /dev/null）
+ * - S_IFBLK: 块设备文件（如/dev/hda, /dev/sda）
+ * - S_IFIFO: FIFO（命名管道）
+ * - S_IFREG: 普通文件（mknod通常不用于创建普通文件）
+ * - S_IFDIR: 目录（mknod通常不用于创建目录）
+ * 
+ * 典型调用：
+ * mknod系统调用 -> do_mknod() -> dir_namei() -> 文件系统mknod方法
+ * 
+ * 安全考虑：
+ * - 只有超级用户可以创建设备文件（通常由sys_mknod检查）
+ * - 设备号范围验证（通常由文件系统检查）
+ * - 目录权限检查（需要写和执行权限）
+ */
 int do_mknod(const char * filename, int mode, dev_t dev)
 {
 	const char * basename;
 	int namelen, error;
 	struct inode * dir;
 
+	/* 第一步：处理文件创建模式
+	 * 应用当前进程的umask掩码，清除不允许的权限位
+	 * 这确保新创建的文件不会有过宽的权限 */
 	mode &= ~current->umask;
+
+	/* 第二步：路径解析
+	 * 解析完整路径，获取最终目录的inode和文件名部分
+	 * NULL表示从当前工作目录开始解析 */
 	error = dir_namei(filename,&namelen,&basename, NULL, &dir);
 	if (error)
 		return error;
+
+	/* 第三步：验证文件名有效性
+	 * 检查文件名是否为空（如路径以'/'结尾） */
 	if (!namelen) {
 		iput(dir);
 		return -ENOENT;
 	}
+
+	/* 第四步：文件系统只读检查
+	 * 防止在只读文件系统上创建设备文件 */
 	if (IS_RDONLY(dir)) {
 		iput(dir);
 		return -EROFS;
 	}
+
+	/* 第五步：目录权限检查
+	 * 创建设备文件需要目录的写和执行权限
+	 * MAY_WRITE: 在目录中创建文件的权限
+	 * MAY_EXEC: 搜索目录的权限 */
 	if (!permission(dir,MAY_WRITE | MAY_EXEC)) {
 		iput(dir);
 		return -EACCES;
 	}
+
+	/* 第六步：文件系统能力检查
+	 * 确保文件系统支持mknod操作
+	 * 某些文件系统（如NFS）可能不支持创建设备文件 */
 	if (!dir->i_op || !dir->i_op->mknod) {
 		iput(dir);
 		return -EPERM;
 	}
+
+	/* 第七步：执行设备文件创建
+	 * 使用信号量保护目录操作，确保创建的原子性 */
 	down(&dir->i_sem);
+	
+	/* 调用具体文件系统的mknod方法
+	 * 文件系统负责：
+	 * 1. 验证设备号的有效性
+	 * 2. 创建新的inode结构
+	 * 3. 设置文件类型和权限
+	 * 4. 关联设备号到inode
+	 * 5. 将inode链接到目录结构 */
 	error = dir->i_op->mknod(dir,basename,namelen,mode,dev);
+	
+	/* 释放目录信号量 */
 	up(&dir->i_sem);
+	
+	/* 返回创建结果
+	 * 成功时设备文件已添加到文件系统
+	 * 失败时error为负的错误码 */
 	return error;
 }
 
