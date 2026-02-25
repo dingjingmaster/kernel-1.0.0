@@ -1383,57 +1383,71 @@ unsigned long paging_init(unsigned long start_mem, unsigned long end_mem)
 	return start_mem;
 }
 
-void mem_init(unsigned long start_low_mem,
-	      unsigned long start_mem, unsigned long end_mem)
+/*
+ * mem_init - 内存管理初始化函数
+ * 
+ * 此函数负责初始化系统的内存管理子系统，包括：
+ * 1. 设置内存映射表
+ * 2. 标记可用和保留的内存页
+ * 3. 建立空闲页链表
+ * 4. 统计各类内存页的数量
+ * 5. 测试CPU的WP(写保护)位功能
+ * 
+ * 参数:
+ *   start_low_mem - 低端内存起始地址(通常为0)
+ *   start_mem    - 可用内存起始地址(内核之后的第一个可用地址)
+ *   end_mem      - 物理内存结束地址
+ */
+void mem_init(unsigned long start_low_mem, unsigned long start_mem, unsigned long end_mem)
 {
-	int codepages = 0;		/* 内核代码页计数器 */
-	int reservedpages = 0;	/* 保留页计数器 */
-	int datapages = 0;		/* 数据页计数器 */
-	unsigned long tmp;		/* 临时变量，用于地址计算 */
+	int codepages = 0;		/* 内核代码页计数器，用于统计内核代码占用的页数 */
+	int reservedpages = 0;	/* 保留页计数器，用于统计保留内存占用的页数 */
+	int datapages = 0;		/* 数据页计数器，用于统计数据占用的页数 */
+	unsigned long tmp;		/* 临时变量，用于地址计算和循环 */
 	unsigned short * p;		/* 指向内存映射表的指针 */
 	extern int etext;		/* 内核代码段结束地址的外部声明 */
 
 	/* 禁用中断，防止内存初始化过程被打断 */
 	cli();
-	/* 将内存结束地址对齐到页边界 */
+	/* 将内存结束地址对齐到页边界(4KB对齐) */
 	end_mem &= PAGE_MASK;
-	/* 设置高端内存边界 */
+	/* 设置高端内存边界，用于内存管理 */
 	high_memory = end_mem;
-	/* 对start_mem进行16字节对齐(向上对齐) */
-	start_mem +=  0x0000000f;
+	/* 对start_mem进行16字节对齐(向上对齐)，确保内存映射表对齐 */
+	start_mem += 0x0000000f;
 	start_mem &= ~0x0000000f;
-	/* 计算内存页总数 */
+	/* 计算内存页总数(总内存大小除以页大小) */
 	tmp = MAP_NR(end_mem);
 	/* 初始化内存映射表，存储在start_mem之后的位置 */
 	mem_map = (unsigned short *) start_mem;
 	/* 指向内存映射表的末尾 */
 	p = mem_map + tmp;
-	/* 更新start_mem到内存映射表之后的位置 */
+	/* 更新start_mem到内存映射表之后的位置，为其他数据结构预留空间 */
 	start_mem = (unsigned long) p;
-	/* 初始化所有内存页为保留状态 */
+	/* 初始化所有内存页为保留状态(MAP_PAGE_RESERVED)，防止被意外使用 */
 	while (p > mem_map)
 		*--p = MAP_PAGE_RESERVED;
-	/* 对低端内存和高端内存起始地址进行页对齐 */
+	/* 对低端内存和高端内存起始地址进行页对齐(4KB对齐) */
 	start_low_mem = PAGE_ALIGN(start_low_mem);
 	start_mem = PAGE_ALIGN(start_mem);
 	/* 标记640KB以下的低端内存为可用(0xA0000 = 640KB) */
 	while (start_low_mem < 0xA0000) {
-		mem_map[MAP_NR(start_low_mem)] = 0;
-		start_low_mem += PAGE_SIZE;
+		mem_map[MAP_NR(start_low_mem)] = 0;	/* 0表示页面可用 */
+		start_low_mem += PAGE_SIZE;	/* 移动到下一页 */
 	}
 	/* 标记高端内存为可用 */
 	while (start_mem < end_mem) {
-		mem_map[MAP_NR(start_mem)] = 0;
-		start_mem += PAGE_SIZE;
+		mem_map[MAP_NR(start_mem)] = 0;	/* 0表示页面可用 */
+		start_mem += PAGE_SIZE;	/* 移动到下一页 */
 	}
 #ifdef CONFIG_SOUND
 	/* 如果配置了声音支持，初始化声音内存 */
 	sound_mem_init();
 #endif
-	/* 初始化空闲页链表 */
-	free_page_list = 0;
+	/* 初始化空闲页链表，用于管理空闲物理页 */
+	free_page_list = 0;	/* 初始为空链表 */
 	/* 初始化空闲页计数器 */
-	nr_free_pages = 0;
+	nr_free_pages = 0;	/* 初始为0 */
 	/* 遍历所有内存页，建立空闲页链表并统计各类页面 */
 	for (tmp = 0 ; tmp < end_mem ; tmp += PAGE_SIZE) {
 		/* 如果页面已被标记(非0)，则不是空闲页 */
@@ -1447,15 +1461,15 @@ void mem_init(unsigned long start_low_mem,
 			/* 其余为数据页 */
 			else
 				datapages++;
-			continue;
+			continue;		/* 跳过已使用的页面 */
 		}
 		/* 将当前空闲页添加到空闲页链表中 */
-		*(unsigned long *) tmp = free_page_list;
-		free_page_list = tmp;
+		*(unsigned long *) tmp = free_page_list;	/* 在页面起始位置存储下一个空闲页的地址 */
+		free_page_list = tmp;		/* 更新空闲页链表头 */
 		/* 增加空闲页计数 */
 		nr_free_pages++;
 	}
-	/* 计算空闲内存总大小(字节) */
+	/* 计算空闲内存总大小(字节)，左移PAGE_SHIFT相当于乘以PAGE_SIZE */
 	tmp = nr_free_pages << PAGE_SHIFT;
 	/* 打印内存使用情况统计信息 */
 	printk("Memory: %luk/%luk available (%dk kernel code, %dk reserved, %dk data)\n",
