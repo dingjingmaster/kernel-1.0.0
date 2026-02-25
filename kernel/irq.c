@@ -320,22 +320,40 @@ static struct sigaction ignore_IRQ = {
 	NULL
 };
 
+/*
+ * init_IRQ - 中断系统初始化函数
+ * 初始化中断描述符表(IDT)中的中断门和底半处理程序
+ * 设置系统中断处理的基础设施，为硬件中断和底半处理做准备
+ * 
+ * 此函数在系统启动时被调用，完成中断系统的初始化
+ * 它为所有可能的中断设置默认处理程序，并初始化底半处理机制
+ */
 void init_IRQ(void)
 {
-	int i;
+	int i;		/* 循环计数器 */
 
+	/* 为IRQ0-15设置默认中断处理程序 */
 	for (i = 0; i < 16 ; i++)
+		/* 设置中断门，指向默认错误处理程序 */
 		set_intr_gate(0x20+i,bad_interrupt[i]);
+	/* 尝试获取IRQ2用于级联中断控制器 */
 	if (irqaction(2,&ignore_IRQ))
+		/* 如果获取失败，打印错误信息 */
 		printk("Unable to get IRQ2 for cascade\n");
+	/* 尝试获取IRQ13用于数学错误处理 */
 	if (request_irq(13,math_error_irq))
+		/* 如果获取失败，打印错误信息 */
 		printk("Unable to get IRQ13 for math-error handler\n");
 
-	/* intialize the bottom half routines. */
+	/* 初始化底半处理程序 */
 	for (i = 0; i < 32; i++) {
+		/* 清空底半处理程序指针 */
 		bh_base[i].routine = NULL;
+		/* 清空底半处理程序数据指针 */
 		bh_base[i].data = NULL;
 	}
+	/* 清空底半处理程序活动标志 */
 	bh_active = 0;
+	/* 清空中断计数器 */
 	intr_count = 0;
 }
