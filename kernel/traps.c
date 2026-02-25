@@ -152,39 +152,46 @@ asmlinkage void do_debug(struct pt_regs * regs, long error_code)
 }
 
 /*
- * Allow the process which triggered the interrupt to recover the error
- * condition.
- *  - the status word is saved in the cs selector.
- *  - the tag word is saved in the operand selector.
- *  - the status word is then cleared and the tags all set to Empty.
+ * math_error - 数学协处理器错误处理函数
+ * 被IRQ13(387)和异常16用于处理数学错误
  *
- * This will give sufficient information for complete recovery provided that
- * the affected process knows or can deduce the code and data segments
- * which were in force when the exception condition arose.
- *
- * Note that we play around with the 'TS' bit to hopefully get
- * the correct behaviour even in the presense of the asynchronous
- * IRQ13 behaviour
+ * 注意：我们通过操作'TS'位来希望在异步IRQ13行为存在的情况下
+ * 获得正确的行为
  */
 void math_error(void)
 {
-	struct i387_hard_struct * env;
+	struct i387_hard_struct * env;	/* 协处理器环境结构体指针 */
 
+	/* 清除任务切换标志(TS)，允许使用数学协处理器 */
 	clts();
+	/* 检查是否有任务使用了数学协处理器 */
 	if (!last_task_used_math) {
-		__asm__("fnclex");
-		return;
+		/* 没有任务使用协处理器，清除异常状态并返回 */
+		__asm__("fnclex");	/* 清除协处理器异常状态 */
+		return;			/* 直接返回 */
 	}
+	/* 获取使用协处理器的任务的协处理器环境指针 */
 	env = &last_task_used_math->tss.i387.hard;
+	/* 向使用协处理器的任务发送浮点异常信号 */
 	send_sig(SIGFPE, last_task_used_math, 1);
+	/* 设置陷阱编号为16(协处理器错误) */
 	last_task_used_math->tss.trap_no = 16;
+	/* 设置错误码为0 */
 	last_task_used_math->tss.error_code = 0;
+	/* 保存协处理器状态到任务结构体中 */
 	__asm__ __volatile__("fnsave %0":"=m" (*env));
+	/* 清除最后一个使用协处理器的任务指针 */
 	last_task_used_math = NULL;
+	/* 设置任务切换标志(TS)，禁止使用数学协处理器 */
 	stts();
+	/* 处理保存的协处理器状态，确保一致性 */
+	/* 修复指令指针的低16位 */
 	env->fcs = (env->swd & 0x0000ffff) | (env->fcs & 0xffff0000);
+	/* 设置操作数指针 */
 	env->fos = env->twd;
+	/* 清除状态字中的某些位 */
 	env->swd &= 0xffff3800;
+	/* 设置标记字为全1(表示空寄存器) */
 	env->twd = 0xffffffff;
 }
 
@@ -194,28 +201,56 @@ asmlinkage void do_coprocessor_error(struct pt_regs * regs, long error_code)
 	math_error();
 }
 
+/*
+ * trap_init - 中断和陷阱门初始化函数
+ * 设置IDT(中断描述符表)中的陷阱门和中断门，
+ * 将硬件陷阱和异常与相应的处理程序关联起来
+ * 
+ * 此函数在系统启动时被调用，完成异常处理机制的初始化
+ * 它为CPU可能产生的各种异常设置处理程序，确保系统能够
+ * 正确响应和处理硬件异常和软件中断
+ */
 void trap_init(void)
 {
-	int i;
+	int i;		/* 循环计数器 */
 
+	/* 设置除法错误陷阱门(向量0) */
 	set_trap_gate(0,&divide_error);
+	/* 设置调试陷阱门(向量1) */
 	set_trap_gate(1,&debug);
+	/* 设置不可屏蔽中断门(向量2) */
 	set_trap_gate(2,&nmi);
+	/* 设置断点陷阱门(向量3) - 可从所有特权级调用 */
 	set_system_gate(3,&int3);	/* int3-5 can be called from all */
+	/* 设置溢出陷阱门(向量4) - 可从所有特权级调用 */
 	set_system_gate(4,&overflow);
+	/* 设置边界检查陷阱门(向量5) - 可从所有特权级调用 */
 	set_system_gate(5,&bounds);
+	/* 设置无效操作码陷阱门(向量6) */
 	set_trap_gate(6,&invalid_op);
+	/* 设置设备不可用陷阱门(向量7) */
 	set_trap_gate(7,&device_not_available);
+	/* 设置双重故障陷阱门(向量8) */
 	set_trap_gate(8,&double_fault);
+	/* 设置协处理器段越界陷阱门(向量9) */
 	set_trap_gate(9,&coprocessor_segment_overrun);
+	/* 设置无效TSS陷阱门(向量10) */
 	set_trap_gate(10,&invalid_TSS);
+	/* 设置段不存在陷阱门(向量11) */
 	set_trap_gate(11,&segment_not_present);
+	/* 设置栈段故障陷阱门(向量12) */
 	set_trap_gate(12,&stack_segment);
+	/* 设置一般保护故障陷阱门(向量13) */
 	set_trap_gate(13,&general_protection);
+	/* 设置页故障陷阱门(向量14) */
 	set_trap_gate(14,&page_fault);
+	/* 设置保留陷阱门(向量15) */
 	set_trap_gate(15,&reserved);
+	/* 设置协处理器错误陷阱门(向量16) */
 	set_trap_gate(16,&coprocessor_error);
+	/* 设置对齐检查陷阱门(向量17) */
 	set_trap_gate(17,&alignment_check);
+	/* 为向量18-47设置保留陷阱门 */
 	for (i=18;i<48;i++)
-		set_trap_gate(i,&reserved);
+		set_trap_gate(i,&reserved);	/* 未使用的异常向量 */
 }
